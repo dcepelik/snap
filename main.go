@@ -172,8 +172,10 @@ func (a *app) prune(p *profileJSON) error {
 		); err != nil {
 			return err
 		}
-		if err := os.Remove(s.path); err != nil {
-			return err
+		if !a.opts.dryRun {
+			if err := os.Remove(s.path); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
