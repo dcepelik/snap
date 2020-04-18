@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -14,7 +16,48 @@ import (
 	"github.com/pborman/getopt/v2"
 )
 
-const defaultDirPerm = 0755
+func agoR(d time.Duration, maxPrec int) (s string) {
+	if maxPrec <= 0 {
+		return ""
+	}
+	ranges := []struct {
+		lt   time.Duration
+		div  time.Duration
+		unit string
+	}{
+		{time.Minute, time.Second, "s"},
+		{time.Hour, time.Minute, "m"},
+		{2 * day, time.Hour, "h"},
+		{month, day, "d"},
+		{3 * month, week, "w"},
+		{2 * year, month, "y"},
+	}
+	div, unit := year, "y"
+	for _, r := range ranges {
+		if d < r.lt {
+			div, unit = r.div, r.unit
+			break
+		}
+	}
+	v := int64(d.Seconds() / div.Seconds())
+	r := time.Duration(d.Seconds()-float64(v)*div.Seconds()) * time.Second
+	tail := ""
+	if r > 1*time.Second {
+		tail = agoR(r, maxPrec-1)
+	}
+	return fmt.Sprintf("%2d%s%s", v, unit, tail)
+}
+
+func ago(d time.Duration, maxPrec int) string {
+	s := agoR(d, maxPrec)
+	if d > 0*time.Second {
+		return s + " ago"
+	}
+	return "in " + s
+}
+
+const defaultDirMode = 0755
+const defaultBtrfsBin = "btrfs"
 
 type snap struct {
 	path    string
@@ -36,13 +79,13 @@ func findSnaps(dir string) ([]*snap, error) {
 	}
 	snaps := make([]*snap, 0, len(fis))
 	for _, fi := range fis {
-		path := path.Join(dir, fi.Name())
+		snapPath := path.Join(dir, fi.Name())
 		createdUnix, err := strconv.ParseInt(fi.Name(), 10, 64)
 		if err != nil {
 			return nil, err
 		}
 		created := time.Unix(createdUnix, 0)
-		snaps = append(snaps, &snap{path, created})
+		snaps = append(snaps, &snap{snapPath, created})
 	}
 	return snaps, nil
 }
@@ -94,8 +137,8 @@ func (c cascade) insert(in []*snap) (out []*snap) {
 		var prevCreated time.Time
 		var insertAt int
 		for i, s := range in {
-			interval := s.created.Sub(prevCreated)
-			if i > 0 && interval < b.interval {
+			d := s.created.Sub(prevCreated)
+			if (i > 0 && d < b.interval) || cap(b.snaps) == 0 {
 				out = append(out, s)
 				continue
 			}
@@ -115,12 +158,6 @@ func (c cascade) insert(in []*snap) (out []*snap) {
 	return out
 }
 
-const (
-	day   = 24 * time.Hour
-	week  = 7 * day
-	month = 30 * day
-)
-
 func (a *app) prune(p *profileJSON) error {
 	snaps, err := findSnaps(*p.Storage)
 	if err != nil {
@@ -128,32 +165,48 @@ func (a *app) prune(p *profileJSON) error {
 	}
 	out := a.cascade.insert(snaps)
 	for _, s := range out {
-		fmt.Println("btrfs", "subvolume", "delete", s.path)
+		if err := a.btrfsCmd(
+			"subvolume",
+			"delete",
+			path.Join(s.path, "snapshot"),
+		); err != nil {
+			return err
+		}
+		if err := os.Remove(s.path); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (a *app) create(p *profileJSON) error {
 	unixStr := strconv.FormatInt(time.Now().Unix(), 10)
-	path := path.Join("", *p.Storage, unixStr)
-	fmt.Println("btrfs", "subvolume", "snapshot", *p.Subvolume, path)
-	if err := os.MkdirAll(path, defaultDirPerm); err != nil {
+	snapPath := path.Join("", *p.Storage, unixStr)
+	if err := os.MkdirAll(snapPath, defaultDirMode); err != nil {
 		return err
 	}
-	return nil
+	subvolPath := path.Join(snapPath, "/snapshot")
+	return a.btrfsCmd(
+		"subvolume",
+		"snapshot",
+		"-r",
+		*p.Subvolume,
+		subvolPath,
+	)
 }
 
 type app struct {
 	cfg     *configJSON
 	cascade cascade
 	opts    struct {
-		create      bool
-		list        bool
-		dryRun      bool
-		verbose     bool
-		prune       bool
-		profileName string
+		btrfsBin    string
 		cfgPath     string
+		create      bool
+		dryRun      bool
+		list        bool
+		profileName string
+		prune       bool
+		verbose     bool
 	}
 }
 
@@ -162,10 +215,41 @@ func (a *app) list(p *profileJSON) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
 	for i, s := range snaps {
-		fmt.Println(i+1, s.path, s.created)
+		delta := now.Sub(s.created)
+		fmt.Printf("%8d\t%10s\t%s\n", i+1, ago(delta, 2), s.path)
 	}
 	return nil
+}
+
+func (a *app) btrfsCmd(args ...string) error {
+	if a.opts.dryRun || a.opts.verbose {
+		// TODO: Escape command-line arguments correctly not to
+		//       produce confusing diagnostics.
+		cmdline := []string{a.opts.btrfsBin}
+		cmdline = append(cmdline, args...)
+		fmt.Fprintln(os.Stderr, strings.Join(cmdline, " "))
+	}
+	if a.opts.dryRun {
+		return nil
+	}
+
+	cmd := exec.Command(a.opts.btrfsBin, args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err == nil {
+		return nil
+	} else if exitErr, ok := err.(*exec.ExitError); ok {
+		stderr := "(stderr empty)"
+		if stderrBuf.Len() > 0 {
+			stderr = strings.Split(stderrBuf.String(), "\n")[0]
+		}
+		return fmt.Errorf("%s: failed with exit code %d: %s",
+			a.opts.btrfsBin, exitErr.ExitCode(), stderr)
+	} else {
+		return err
+	}
 }
 
 func (a *app) run() error {
@@ -209,7 +293,7 @@ func (a *app) run() error {
 
 func main() {
 	a := &app{}
-	a.opts.cfgPath = "config.json"
+	a.opts.cfgPath = "/etc/snap/config.json"
 	var err error
 	a.cfg, err = loadConfig(a.opts.cfgPath)
 	if err != nil {
@@ -226,6 +310,8 @@ func main() {
 		"remove snapshots according to retention policy")
 	getopt.FlagLong(&a.opts.verbose, "verbose", 'v',
 		"explain what is being done")
+	a.opts.btrfsBin = *getopt.StringLong("btrfs-bin", 'b', defaultBtrfsBin,
+		"name of the btrfs binary (searched in $PATH)")
 	getopt.SetParameters("profile-name")
 	getopt.Parse()
 
@@ -237,7 +323,7 @@ func main() {
 	a.opts.profileName = getopt.Arg(0)
 
 	if err := a.run(); err != nil {
-		fmt.Fprintln(os.Stderr, "TODO: %v", err)
+		fmt.Fprintf(os.Stderr, "TODO: %s\n", err.Error())
 		os.Exit(1)
 	}
 }

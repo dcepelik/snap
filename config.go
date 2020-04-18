@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+const day = 24 * time.Hour
+const week = 7 * day
+const month = 30 * day
+const year = 365 * day
+
 type ProfileName = string
 
 type BucketInterval time.Duration
@@ -28,10 +33,6 @@ func (d *BucketInterval) UnmarshalText(text []byte) (err error) {
 	if err != nil {
 		return
 	}
-	const day = 24 * time.Hour
-	const week = 7 * day
-	const month = 30 * day
-	const year = 365 * day
 	nd := time.Duration(n)
 	switch unit {
 	case 's':
@@ -88,7 +89,7 @@ func (p *profileJSON) validate() error {
 
 type bucketJSON struct {
 	Interval *BucketInterval
-	Size    *int
+	Size     *int
 }
 
 func (b *bucketJSON) validate() error {
@@ -102,7 +103,7 @@ func (b *bucketJSON) validate() error {
 }
 
 func loadConfig(filename string) (*configJSON, error) {
-	f, err := os.Open("config.json")
+	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
