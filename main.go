@@ -165,12 +165,30 @@ func (a *app) prune(p *profileJSON) error {
 	}
 	out := a.cascade.insert(snaps)
 	for _, s := range out {
-		if err := a.btrfsCmd(
-			"subvolume",
-			"delete",
-			path.Join(s.path, "snapshot"),
-		); err != nil {
-			return err
+		snapPath := path.Join(s.path, "snapshot")
+		if _, err := os.Stat(snapPath); !os.IsNotExist(err) {
+			// We're creating read-only subvolumes, which makes it
+			// impossible for non-root-users to delete them. Since
+			// we don't require to be run as root, unset the
+			// read-only property.
+			if err := a.btrfsCmd(
+				"property",
+				"set",
+				"-t", "subvol",
+				snapPath,
+				"ro",
+				"false",
+			); err != nil {
+				return err
+			}
+			// Delete the subvolume.
+			if err := a.btrfsCmd(
+				"subvolume",
+				"delete",
+				snapPath,
+			); err != nil {
+				return err
+			}
 		}
 		if !a.opts.dryRun {
 			if err := os.Remove(s.path); err != nil {
