@@ -1,0 +1,44 @@
+{
+  "Profiles": {
+    "etc": {
+      "Buckets": [
+        {
+          "Interval": "1h",
+          "Size": 24
+        },
+        {
+          "Interval": "1d",
+          "Size": 7
+        },
+        {
+          "Interval": "1w",
+          "Size": 4
+        }
+      ],
+      "Storage": "/snap/etc",
+      "Subvolume": "/etc"
+    },
+    "home": {
+      "Buckets": [
+        {
+          "Interval": "1m",
+          "Size": 60
+        },
+        {
+          "Interval": "1h",
+          "Size": 48
+        },
+        {
+          "Interval": "1d",
+          "Size": 15
+        },
+        {
+          "Interval": "1M",
+          "Size": 2
+        }
+      ],
+      "Storage": "/snap/home",
+      "Subvolume": "/home"
+    }
+  }
+}
