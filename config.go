@@ -69,14 +69,15 @@ func (c *configJSON) validate() error {
 }
 
 type profileJSON struct {
-	Subvolume *string
-	Storage   *string
+	Backup    *string
 	Buckets   []*bucketJSON
+	Storage   *string
+	Subvolume *string
 }
 
 func (p *profileJSON) validate() error {
-	if p.Subvolume == nil {
-		return fmt.Errorf("profile %q: Subvolume missing")
+	if (p.Subvolume == nil) == (p.Backup == nil) {
+		return fmt.Errorf("either Backup or Subvolume must be configured")
 	}
 	for i, b := range p.Buckets {
 		if err := b.validate(); err != nil {

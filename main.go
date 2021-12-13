@@ -2,66 +2,33 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pborman/getopt/v2"
+	"golang.org/x/sync/errgroup"
 )
 
-func agoR(d time.Duration, maxPrec int) (s string) {
-	if maxPrec <= 0 {
-		return ""
-	}
-	ranges := []struct {
-		lt   time.Duration
-		div  time.Duration
-		unit string
-	}{
-		{time.Minute, time.Second, "s"},
-		{time.Hour, time.Minute, "m"},
-		{2 * day, time.Hour, "h"},
-		{month, day, "d"},
-		{3 * month, week, "w"},
-		{2 * year, month, "y"},
-	}
-	div, unit := year, "y"
-	for _, r := range ranges {
-		if d < r.lt {
-			div, unit = r.div, r.unit
-			break
-		}
-	}
-	v := int64(d.Seconds() / div.Seconds())
-	r := time.Duration(d.Seconds()-float64(v)*div.Seconds()) * time.Second
-	tail := ""
-	if r > 1*time.Second {
-		tail = agoR(r, maxPrec-1)
-	}
-	return fmt.Sprintf("%2d%s%s", v, unit, tail)
-}
-
-func ago(d time.Duration, maxPrec int) string {
-	s := agoR(d, maxPrec)
-	if d > 0*time.Second {
-		return s + " ago"
-	}
-	return "in " + s
-}
-
-const defaultDirMode = 0755
-const defaultBtrfsBin = "btrfs"
+const (
+	defaultDirMode     = 0755
+	defaultBtrfsBin    = "btrfs"
+	defaultConfigPath  = "/etc/snap/config.json"
+	snapshotDateLayout = "2006-01-02_15:04:05"
+)
 
 type snap struct {
-	path    string
-	created time.Time
+	path, subvolPath string
+	created          time.Time
 }
 
 func (s *snap) String() string {
@@ -80,82 +47,21 @@ func findSnaps(dir string) ([]*snap, error) {
 	snaps := make([]*snap, 0, len(fis))
 	for _, fi := range fis {
 		snapPath := path.Join(dir, fi.Name())
-		createdUnix, err := strconv.ParseInt(fi.Name(), 10, 64)
+		created, err := time.Parse(snapshotDateLayout, fi.Name())
 		if err != nil {
-			return nil, err
+			continue
 		}
-		created := time.Unix(createdUnix, 0)
-		snaps = append(snaps, &snap{snapPath, created})
+		// FIXME: This way of "detecting" subvolumes sucks. It would be
+		//     way better to just use `btrfs subvolume list`, but that
+		//     requires SYS_CAP_ADMIN. Is this mess worth being able
+		//     to run snap as regular user?
+		subvolPath := path.Join(snapPath, "snapshot")
+		if sfi, err := os.Lstat(subvolPath); err != nil || !sfi.IsDir() {
+			continue
+		}
+		snaps = append(snaps, &snap{snapPath, subvolPath, created})
 	}
 	return snaps, nil
-}
-
-type bucket struct {
-	interval time.Duration
-	snaps    []*snap
-}
-
-func newBucket(interval time.Duration, size int) *bucket {
-	if size <= 0 {
-		panic("bug: bucket size must be positive")
-	}
-	return &bucket{
-		interval: interval,
-		snaps:    make([]*snap, 0, size),
-	}
-}
-
-func (b bucket) String() string {
-	return fmt.Sprintf("%s: %v", b.interval, b.snaps)
-}
-
-// cascade is a cascade of buckets which support hierarchical eviction.
-type cascade []*bucket
-
-func newCascade() cascade {
-	return make(cascade, 0)
-}
-
-func (c *cascade) addBucket(b *bucketJSON) {
-	*c = append(*c, &bucket{
-		interval: time.Duration(*b.Interval),
-		snaps:    make([]*snap, 0, *b.Size),
-	})
-}
-
-// insert puts in snapshots into the top bucket. If that bucket is full, oldest
-// snapshots are evicted to lower buckets. Any snapshots which don't fit the
-// last bucket are returned in out.
-//
-// Insertion respect bucket intervals: TODO.
-func (c cascade) insert(in []*snap) (out []*snap) {
-	sort.Slice(in, func(i, j int) bool {
-		return in[i].created.Before(in[j].created)
-	})
-	var overflow []*snap
-	for _, b := range c {
-		var prevCreated time.Time
-		var insertAt int
-		for i, s := range in {
-			d := s.created.Sub(prevCreated)
-			if (i > 0 && d < b.interval) || cap(b.snaps) == 0 {
-				out = append(out, s)
-				continue
-			}
-			b.snaps = b.snaps[0 : insertAt+1]
-			if t := b.snaps[insertAt]; t != nil {
-				overflow = append(overflow, t)
-			}
-			b.snaps[insertAt] = s
-			insertAt++
-			insertAt %= cap(b.snaps)
-			prevCreated = s.created
-		}
-		in = overflow
-		overflow = overflow[:0]
-	}
-	out = append(out, in...)
-	return out
 }
 
 func (a *app) prune(p *profileJSON) error {
@@ -175,6 +81,7 @@ func (a *app) prune(p *profileJSON) error {
 				"property",
 				"set",
 				"-t", "subvol",
+				"-f",
 				snapPath,
 				"ro",
 				"false",
@@ -200,12 +107,18 @@ func (a *app) prune(p *profileJSON) error {
 }
 
 func (a *app) create(p *profileJSON) error {
-	unixStr := strconv.FormatInt(time.Now().Unix(), 10)
-	snapPath := path.Join("", *p.Storage, unixStr)
+	if p.Subvolume == nil {
+		return errors.New("this is a backup profile")
+	}
+	snapPath := path.Join("", *p.Storage, time.Now().UTC().Format(snapshotDateLayout))
 	if err := os.MkdirAll(snapPath, defaultDirMode); err != nil {
 		return err
 	}
 	subvolPath := path.Join(snapPath, "/snapshot")
+	// Snapshots are atomic. This either fails or a snapshot gets created.
+	// No cleanup is required. But if the snapshot isn't created, the
+	// os.Remove below will remove the empty directory afterwards.
+	defer os.Remove(snapPath)
 	return a.btrfsCmd(
 		"subvolume",
 		"snapshot",
@@ -215,12 +128,175 @@ func (a *app) create(p *profileJSON) error {
 	)
 }
 
+// TODO: Implement dry run.
+func (a *app) backup(p *profileJSON) error {
+	if p.Backup == nil {
+		return errors.New("this is not a backup profile")
+	}
+
+	srcProfile := a.cfg.Profiles[*p.Backup]
+	if srcProfile == nil {
+		panic("FIXME") // FIXME
+	}
+	src, err := findSnaps(*srcProfile.Storage)
+	if err != nil {
+		return err
+	}
+	dst, err := findSnaps(*p.Storage)
+	if err != nil {
+		return err
+	}
+
+	srcM := make(map[time.Time]*snap, len(src))
+	for _, s := range src {
+		srcM[s.created] = s
+	}
+	dstM := make(map[time.Time]*snap, len(dst))
+	for _, s := range dst {
+		dstM[s.created] = s
+	}
+
+	// Calculate which snapshots we need to backup ("need", present in src,
+	// but not in dst) and which ones we can use as bases for incremental
+	// backup ("have", are both in src and in dst).
+	need := make(map[time.Time]*snap)
+	have := make(map[time.Time]*snap)
+	for st, ss := range srcM {
+		if _, ok := dstM[st]; !ok {
+			need[st] = ss
+		} else {
+			have[st] = ss
+		}
+	}
+
+	needS := make([]*snap, 0, len(need))
+	for _, s := range need {
+		needS = append(needS, s)
+	}
+	sort.Slice(needS, func(i, j int) bool {
+		return needS[i].created.Before(needS[j].created)
+	})
+
+	// Figure out snapshots are unwanted (= would be deleted by next prune
+	// operation = do not the retention policy of the target). Those we
+	// will not back up.
+	wouldHave := append(dst, needS...)
+	unwanted := make(map[time.Time]*snap)
+	for _, s := range a.cascade.insert(wouldHave) {
+		unwanted[s.created] = s
+	}
+	a.cascade.reset()
+
+	haveS := make([]*snap, 0, len(have)+len(need))
+	for _, s := range have {
+		haveS = append(haveS, s)
+	}
+	sort.Slice(haveS, func(i, j int) bool {
+		return haveS[i].created.Before(haveS[j].created)
+	})
+
+	for _, s := range needS {
+		if _, ok := unwanted[s.created]; ok {
+			continue
+		}
+		if err := a.backupSingle(srcProfile, p, s, haveS); err != nil {
+			return fmt.Errorf("cannot backup %s: %w", s.path, err)
+		}
+		haveS = append(haveS, s)
+	}
+	return nil
+}
+
+func (a *app) backupSingle(srcP, dstP *profileJSON, s *snap, have []*snap) error {
+	name := s.created.Format(snapshotDateLayout)
+	snapPath := path.Join("", *dstP.Storage, name)
+
+	startAndWait := func(cmd *exec.Cmd, name string) error {
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		if err := cmd.Wait(); err != nil {
+			raw := strings.TrimSpace(stderr.String())
+			if len(raw) == 0 {
+				return err
+			}
+			lines := strings.Split(raw, "\n")
+			sample := lines[0]
+			if n := len(lines); n > 1 {
+				sample += fmt.Sprintf(" [%d more lines...]", n-1)
+			}
+			return fmt.Errorf("%s: %w (stderr: %q)", name, err, sample)
+		}
+		return nil
+	}
+
+	pr, pw := io.Pipe()
+	g, ctx := errgroup.WithContext(context.Background())
+
+	// btrfs receive ...
+	recvPath, err := os.MkdirTemp(*dstP.Storage, name + ".recv.*")
+	_ = os.Chmod(recvPath, defaultDirMode)
+	defer os.Remove(recvPath)
+	if err != nil {
+		return fmt.Errorf("os.MkdirTemp: %w", err)
+	}
+	recvArgs := []string{"receive", recvPath}
+	recv := exec.CommandContext(ctx, *a.opts.btrfsBin, recvArgs...)
+	recv.Stdin = pr
+
+	// btrfs send ...
+	sendArgs := []string{"send"}
+	var parentPath string
+	for _, hs := range have {
+		if hs.created.Before(s.created) {
+			parentPath = hs.subvolPath
+		}
+		sendArgs = append(sendArgs, "-c")
+		sendArgs = append(sendArgs, hs.subvolPath)
+	}
+	if parentPath != "" {
+		sendArgs = append(sendArgs, "-p")
+		sendArgs = append(sendArgs, parentPath)
+	}
+	sendArgs = append(sendArgs, s.subvolPath)
+	send := exec.CommandContext(ctx, *a.opts.btrfsBin, sendArgs...)
+	send.Stdout = pw
+
+	if a.opts.dryRun || a.opts.verbose {
+		cmdline := []string{"btrfs"}
+		cmdline = append(cmdline, escapedArgs(sendArgs, 3)...)
+		cmdline = append(cmdline, "|", "btrfs")
+		cmdline = append(cmdline, escapedArgs(recvArgs, 3)...)
+		fmt.Fprintln(os.Stderr, strings.Join(cmdline, " "))
+	}
+	if a.opts.dryRun {
+		return nil
+	}
+
+	g.Go(func() error {
+		defer pr.Close()
+		return startAndWait(recv, "btrfs receive")
+	})
+	g.Go(func() error {
+		defer pw.Close()
+		return startAndWait(send, "btrfs send")
+	})
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	os.Remove(snapPath) // Remove any previous (unused) snapshot directory
+	return os.Rename(recvPath, snapPath)
+}
+
 type app struct {
 	cfg     *configJSON
 	cascade cascade
 	opts    struct {
-		btrfsBin    string
-		cfgPath     string
+		backup      bool
+		btrfsBin    *string
+		cfgPath     *string
 		create      bool
 		dryRun      bool
 		list        bool
@@ -235,7 +311,7 @@ func (a *app) list(p *profileJSON) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 	for i, s := range snaps {
 		delta := now.Sub(s.created)
 		fmt.Printf("%8d\t%10s\t%s\n", i+1, ago(delta, 2), s.path)
@@ -243,33 +319,62 @@ func (a *app) list(p *profileJSON) error {
 	return nil
 }
 
+func escapedArgs(args []string, max int) []string {
+	maxArgs := args
+	if max > 0 && len(args) > max {
+		maxArgs = append([]string{args[0], "..."}, args[len(args)-max:]...)
+	}
+	escapedArgs := make([]string, len(maxArgs))
+	for i, a := range maxArgs {
+		var escape bool
+	loop:
+		for _, r := range a {
+			switch {
+			case r == '-':
+			case r == '.':
+			case r == '/':
+			case r == '@':
+			case r == '_':
+			case r >= '0' && r <= '9':
+			case r >= 'A' && r <= 'Z':
+			case r >= 'a' && r <= 'z':
+			default:
+				escape = true
+				break loop
+			}
+		}
+		escapedArgs[i] = a
+		if escape {
+			escapedArgs[i] = fmt.Sprintf("%q", escapedArgs[i])
+		}
+	}
+	return escapedArgs
+}
+
 func (a *app) btrfsCmd(args ...string) error {
 	if a.opts.dryRun || a.opts.verbose {
-		// TODO: Escape command-line arguments correctly not to
-		//       produce confusing diagnostics.
-		cmdline := []string{a.opts.btrfsBin}
-		cmdline = append(cmdline, args...)
-		fmt.Fprintln(os.Stderr, strings.Join(cmdline, " "))
+		argsStr := strings.Join(escapedArgs(args, 10), ", ")
+		fmt.Fprintf(os.Stderr, "exec.Command(%s)\n", argsStr)
 	}
 	if a.opts.dryRun {
 		return nil
 	}
 
-	cmd := exec.Command(a.opts.btrfsBin, args...)
+	cmd := exec.Command(*a.opts.btrfsBin, args...)
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
-	if err := cmd.Run(); err == nil {
-		return nil
-	} else if exitErr, ok := err.(*exec.ExitError); ok {
+	err := cmd.Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
 		stderr := "(stderr empty)"
 		if stderrBuf.Len() > 0 {
 			stderr = strings.Split(stderrBuf.String(), "\n")[0]
 		}
 		return fmt.Errorf("%s: failed with exit code %d: %s",
-			a.opts.btrfsBin, exitErr.ExitCode(), stderr)
-	} else {
+			*a.opts.btrfsBin, exitErr.ExitCode(), stderr)
+	} else if err != nil {
 		return err
 	}
+	return nil
 }
 
 func (a *app) run() error {
@@ -281,7 +386,7 @@ func (a *app) run() error {
 			knownNames = append(knownNames, fmt.Sprintf("%q", n))
 		}
 		knownStr := strings.Join(knownNames, ", ")
-		from := a.opts.cfgPath
+		from := *a.opts.cfgPath
 		if fullCfgPath, err := filepath.Abs(from); err == nil {
 			from = fullCfgPath
 		}
@@ -298,6 +403,15 @@ func (a *app) run() error {
 			return fmt.Errorf("cannot create snapshot: %w", err)
 		}
 	}
+	if a.opts.backup {
+		if err := a.backup(profile); err != nil {
+			return fmt.Errorf("cannot backup profile: %w", err)
+		}
+	}
+	a.cascade = newCascade()
+	for _, b := range profile.Buckets {
+		a.cascade.addBucket(b)
+	}
 	if a.opts.prune {
 		if err := a.prune(profile); err != nil {
 			return fmt.Errorf("cannot prune snapshots: %w", err)
@@ -313,28 +427,31 @@ func (a *app) run() error {
 
 func main() {
 	a := &app{}
-	a.opts.cfgPath = "/etc/snap/config.json"
-	var err error
-	a.cfg, err = loadConfig(a.opts.cfgPath)
-	if err != nil {
-		panic(err)
-	}
-	a.cascade = newCascade()
+	a.opts.cfgPath = getopt.StringLong("config", 'C', defaultConfigPath,
+		"path to config file")
+	a.opts.btrfsBin = getopt.StringLong("btrfs-bin", 'B', defaultBtrfsBin,
+		"name of the btrfs binary (searched in $PATH)")
+	getopt.FlagLong(&a.opts.backup, "backup", 'b',
+		"backup snapshots")
 	getopt.FlagLong(&a.opts.create, "create", 'c',
 		"create a snapshot")
 	getopt.FlagLong(&a.opts.dryRun, "dry-run", 0,
 		"print what would be done, but don't do anything")
 	getopt.FlagLong(&a.opts.list, "list", 'l',
 		"list all snapshots")
-	getopt.FlagLong(&a.opts.prune, "prune", 'X',
-		"remove snapshots according to retention policy")
 	getopt.FlagLong(&a.opts.verbose, "verbose", 'v',
 		"explain what is being done")
-	a.opts.btrfsBin = *getopt.StringLong("btrfs-bin", 'b', defaultBtrfsBin,
-		"name of the btrfs binary (searched in $PATH)")
+	getopt.FlagLong(&a.opts.prune, "prune", 'X',
+		"remove snapshots according to retention policy")
 	getopt.SetParameters("profile-name")
 	getopt.Parse()
 
+	var err error
+	a.cfg, err = loadConfig(*a.opts.cfgPath)
+	if err != nil {
+		panic(err)
+	}
+	a.cascade = newCascade()
 	if getopt.NArgs() != 1 {
 		fmt.Fprintln(os.Stderr, "profile-name argument missing")
 		getopt.Usage()
@@ -343,7 +460,7 @@ func main() {
 	a.opts.profileName = getopt.Arg(0)
 
 	if err := a.run(); err != nil {
-		fmt.Fprintf(os.Stderr, "TODO: %s\n", err.Error())
+		fmt.Fprintf(os.Stderr, "snap: %s: %s\n", a.opts.profileName, err.Error())
 		os.Exit(1)
 	}
 }

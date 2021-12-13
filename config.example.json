@@ -39,6 +39,16 @@
       ],
       "Storage": "/snap/home",
       "Subvolume": "/home"
+    },
+    "home-backup": {
+      "Backup": "home",
+      "Buckets": [
+        {
+          "Interval": "1d",
+          "Size": 60
+        }
+      ],
+      "Storage": "/backup/home"
     }
   }
 }
