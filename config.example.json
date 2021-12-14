@@ -48,7 +48,7 @@
           "Size": 60
         }
       ],
-      "Storage": "/backup/home"
+      "Storage": "/mnt/backup/snap/home"
     }
   }
 }
