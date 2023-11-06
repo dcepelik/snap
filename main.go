@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -62,6 +63,108 @@ func findSnaps(dir string) ([]*snap, error) {
 		snaps = append(snaps, &snap{snapPath, subvolPath, created})
 	}
 	return snaps, nil
+}
+
+type app struct {
+	cfg     *configJSON
+	cascade cascade
+	opts    struct {
+		backup      bool
+		btrfsBin    *string
+		cfgPath     *string
+		create      bool
+		dryRun      bool
+		list        bool
+		listFiles   *string
+		profileName string
+		prune       bool
+		verbose     bool
+	}
+}
+
+type fileBackup struct {
+	Name    string
+	Dir     string
+	Size    int64
+	ModTime time.Time
+	Mode    fs.FileMode
+}
+
+func (a fileBackup) Less(b *fileBackup) bool {
+	if a.Name == b.Name {
+		return a.ModTime.Before(b.ModTime)
+	}
+	return a.Name < b.Name
+}
+
+func (a *app) listFiles(p *profileJSON) error {
+	path := *a.opts.listFiles
+	if !filepath.IsAbs(path) {
+		pwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("os.Getpwd: %w", err)
+		}
+		path = filepath.Join(pwd, path)
+	}
+	snaps, err := findSnaps(*p.Storage)
+	if err != nil {
+		return err
+	}
+	backups := make(map[fileBackup]*snap)
+	for _, s := range snaps {
+		backupPath := filepath.Join(s.subvolPath, path)
+		fi, err := os.Stat(backupPath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		fis := make([]fs.FileInfo, 0, 1)
+		var dir string
+		if fi.IsDir() {
+			dir = path
+			des, err := os.ReadDir(backupPath)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			for _, de := range des {
+				fi, err := de.Info()
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				fis = append(fis, fi)
+			}
+		} else {
+			dir = filepath.Dir(path)
+			fis = append(fis, fi)
+		}
+		for _, fi := range fis {
+			if fi.IsDir() {
+				continue
+			}
+			backups[fileBackup{
+				Name:    filepath.Join(dir, fi.Name()),
+				Size:    fi.Size(),
+				ModTime: fi.ModTime(),
+				Mode:    fi.Mode(),
+			}] = s
+		}
+	}
+	byName := make([]*fileBackup, 0, len(backups))
+	for b := range backups {
+		tmp := b
+		byName = append(byName, &tmp)
+	}
+	sort.Slice(byName, func(i, j int) bool { return byName[i].Less(byName[j]) })
+	for _, b := range byName {
+		s := backups[*b]
+		fullPath := filepath.Join(s.subvolPath, b.Dir, b.Name)
+		fmt.Printf("%11s\t%10d\t%-8s\t%s\n",
+			b.Mode.String(),
+			b.Size,
+			agoR(time.Since(b.ModTime), 2),
+			fullPath,
+		)
+	}
+	return nil
 }
 
 func (a *app) prune(p *profileJSON) error {
@@ -220,7 +323,7 @@ func (a *app) backupSingle(srcP, dstP *profileJSON, s *snap, have []*snap) error
 	g, ctx := errgroup.WithContext(context.Background())
 
 	// btrfs receive ...
-	recvPath, err := os.MkdirTemp(*dstP.Storage, name + ".recv.*")
+	recvPath, err := os.MkdirTemp(*dstP.Storage, name+".recv.*")
 	_ = os.Chmod(recvPath, defaultDirMode)
 	defer os.Remove(recvPath)
 	if err != nil {
@@ -272,22 +375,6 @@ func (a *app) backupSingle(srcP, dstP *profileJSON, s *snap, have []*snap) error
 	}
 	os.Remove(snapPath) // Remove any previous (unused) snapshot directory
 	return os.Rename(recvPath, snapPath)
-}
-
-type app struct {
-	cfg     *configJSON
-	cascade cascade
-	opts    struct {
-		backup      bool
-		btrfsBin    *string
-		cfgPath     *string
-		create      bool
-		dryRun      bool
-		list        bool
-		profileName string
-		prune       bool
-		verbose     bool
-	}
 }
 
 func (a *app) list(p *profileJSON) error {
@@ -406,6 +493,11 @@ func (a *app) run() error {
 			return fmt.Errorf("cannot list snapshots: %w", err)
 		}
 	}
+	if a.opts.listFiles != nil {
+		if err := a.listFiles(profile); err != nil {
+			return fmt.Errorf("cannot listFiles files: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -424,10 +516,12 @@ func main() {
 	getopt.FlagLong(&a.opts.list, "list", 'l',
 		"list all snapshots")
 	getopt.FlagLong(&a.opts.verbose, "verbose", 'v',
-		"explain what is being done")
+		"print what is being done")
 	getopt.FlagLong(&a.opts.prune, "prune", 'X',
 		"remove snapshots according to retention policy")
-	getopt.SetParameters("profile-name")
+	a.opts.listFiles = getopt.StringLong("list-files", 'L',
+		"list all distinct backups of files in a given directory")
+	getopt.SetParameters("profile")
 	getopt.Parse()
 
 	var err error

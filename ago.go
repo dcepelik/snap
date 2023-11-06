@@ -19,7 +19,7 @@ func agoR(d time.Duration, maxPrec int) (s string) {
 		{2 * day, time.Hour, "h"},
 		{month, day, "d"},
 		{3 * month, week, "w"},
-		{2 * year, month, "y"},
+		{2 * year, month, "mo"},
 	}
 	div, unit := year, "y"
 	for _, r := range ranges {
@@ -34,7 +34,7 @@ func agoR(d time.Duration, maxPrec int) (s string) {
 	if r > 1*time.Second {
 		tail = agoR(r, maxPrec-1)
 	}
-	return fmt.Sprintf("%2d%s%s", v, unit, tail)
+	return fmt.Sprintf("%2d%-2s%s", v, unit, tail)
 }
 
 func ago(d time.Duration, maxPrec int) string {
